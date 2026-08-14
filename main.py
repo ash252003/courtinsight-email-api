@@ -1,24 +1,27 @@
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel, EmailStr, field_validator
-import smtplib
 import logging
 import os
-from email.mime.text import MIMEText
-from email.utils import formataddr
+
+import httpx
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel, EmailStr, field_validator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mailer")
 
 app = FastAPI()
 
-SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-API_KEY = os.getenv("MAILER_API_KEY")  # simple shared-secret auth
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+FROM_EMAIL = os.getenv("FROM_EMAIL")  # e.g. "Your App <onboarding@resend.dev>"
+API_KEY = os.getenv("MAILER_API_KEY")  # shared secret for callers of this API
 
-if not SMTP_EMAIL or not SMTP_PASSWORD:
-    raise RuntimeError("SMTP_EMAIL and SMTP_PASSWORD env vars must be set")
+if not RESEND_API_KEY:
+    raise RuntimeError("RESEND_API_KEY env var must be set")
+if not FROM_EMAIL:
+    raise RuntimeError("FROM_EMAIL env var must be set")
 if not API_KEY:
     raise RuntimeError("MAILER_API_KEY env var must be set")
+
+RESEND_URL = "https://api.resend.com/emails"
 
 
 class EmailRequest(BaseModel):
@@ -48,20 +51,26 @@ def send_email(req: EmailRequest, x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    msg = MIMEText(req.message)
-    msg["Subject"] = req.subject
-    msg["From"] = formataddr(("Your App", SMTP_EMAIL))
-    msg["To"] = req.to
+    payload = {
+        "from": FROM_EMAIL,
+        "to": [req.to],
+        "subject": req.subject,
+        "text": req.message,
+    }
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.send_message(msg)
-    except smtplib.SMTPException:
-        logger.exception("SMTP send failed")
-        raise HTTPException(status_code=502, detail="Failed to send email")
-    except Exception:
-        logger.exception("Unexpected error sending email")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        response = httpx.post(RESEND_URL, json=payload, headers=headers, timeout=10)
+    except httpx.RequestError:
+        logger.exception("Network error calling Resend")
+        raise HTTPException(status_code=502, detail="Failed to reach email provider")
 
-    return {"status": "sent"}
+    if response.status_code >= 400:
+        logger.error("Resend API error: %s %s", response.status_code, response.text)
+        raise HTTPException(status_code=502, detail="Failed to send email")
+
+    data = response.json()
+    return {"status": "sent", "id": data.get("id")}
